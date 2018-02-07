@@ -9,9 +9,154 @@
 #include <string.h>
 #include <time.h>
 #include <dirent.h>
+#include <stdarg.h>
 
 #define MAX_TEMP 110.0
 #define MIN_TEMP 85.0
+
+typedef struct _Fan {
+	int rpm, num, min, max;
+	FILE *speed_f;
+} Fan;
+
+void flog(char *fmt, ...) {
+	time_t timer;
+	char buf[26];
+	struct tm *tm_info;
+	va_list lst;
+
+	time(&timer);
+	tm_info = localtime(&timer);
+	strftime(buf, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+
+	fprintf(stderr, "\n[%s] - ", buf);
+
+	va_start(lst, fmt);
+	vfprintf(stderr, fmt, lst);
+	va_end(lst);
+	fflush(stderr);
+}
+
+double proc_temp() {
+	char temp_s[10];
+	FILE *temp_f = fopen("/sys/devices/platform/applesmc.768/temp7_input", "r");
+	fgets(temp_s, 10, temp_f);
+	fclose(temp_f);
+
+	return atoi(temp_s)*(9.0/5.0)/1000.0 + 32.0;
+}
+
+void fan_conf(double *min, double *max) {
+	FILE *conf_f = fopen("/etc/fans/fans.conf", "r");
+	if (!conf_f) {
+		return;
+	}
+	char buf[5];
+	fgets(buf, 5, conf_f);
+	*max = (double)atoi(buf);
+	fgets(buf, 5, conf_f);
+	*min = (double)atoi(buf);
+
+	fclose(conf_f);
+}
+
+int fan_manual(int fan, int opt) {
+	size_t len = strlen("/sys/devices/platform/applesmc.768/fanX_manual");
+	char *fname = malloc(len+1);
+
+	sprintf(fname, "/sys/devices/platform/applesmc.768/fan%d_manual", fan);
+	FILE *ctl_f = fopen(fname, "w");
+	if (!ctl_f) {
+		return EXIT_FAILURE;
+	}
+	if (fwrite(&opt, sizeof(opt), 1, ctl_f) != 1) {
+		fclose(ctl_f);
+		free(fname);
+		return EXIT_FAILURE;	
+	}
+
+	fclose(ctl_f);
+	free(fname);
+	return EXIT_SUCCESS;
+}
+
+int fan_minmax(int fan, int *min, int *max) {
+	if (!max || !min) {
+		return EXIT_FAILURE;
+	}
+
+	size_t len = strlen("/sys/devices/platform/applesmc.768/fanX_mXX");
+	char *fname = malloc(len+1);
+	char buf[6];
+
+	sprintf(fname, "/sys/devices/platform/applesmc.768/fan%d_min", fan);
+	FILE *min_f = fopen(fname, "r");
+	if (!min_f) {
+		free(fname);
+		return EXIT_FAILURE;
+	}
+	fgets(buf, 6, min_f);
+	fclose(min_f);
+	*min = atoi(buf);
+
+	sprintf(fname, "/sys/devices/platform/applesmc.768/fan%d_max", fan);
+	FILE *max_f = fopen(fname, "r");
+	if (!max_f) {
+		free(fname);
+		return EXIT_FAILURE;
+	}
+	fgets(buf, 6, max_f);
+	fclose(max_f);
+	*max = atoi(buf);
+
+	free(fname);
+	return EXIT_SUCCESS;
+}
+
+Fan *fan_init(int fans) {
+	Fan *fan_a = malloc(sizeof(*fan_a)*fans);
+	int len = strlen("/sys/devices/platform/applesmc.768/fanX_output");
+	for (int i = 0; i < fans; i++) {
+		fan_a[i].num = i+1;
+		if (fan_manual(i+1, 1)) {
+			flog("Error setting manual fan control for fan %d\n", i+1);
+		}
+
+		char *speed_fname = malloc(len+1);
+		sprintf(speed_fname, "/sys/devices/platform/applesmc.768/fan%d_output", i+1);
+		fan_a[i].speed_f = fopen(speed_fname, "a");
+		free(speed_fname);
+
+		if (fan_minmax(i+1, &(fan_a[i].min), &(fan_a[i].max))) { 
+			flog("Error fetching min and max RPM for fan %d\n", i+1);
+		}
+
+		flog("Fan %d configuration\n============\nMin RPM: %d Max RPM: %d\n", i+1, fan_a[i].min, fan_a[i].max);
+	}
+	return fan_a;
+}
+
+void fan_close(Fan *fans, int cnt) {
+	for (int i = 0; i < cnt; i++) {
+		fclose(fans[i].speed_f);
+	}
+	free(fans);
+}
+
+void fan_adjust(Fan *fans, int cnt, double temp, double temp_min, double temp_max) {
+	double pct = ((double)temp-temp_min)/(temp_max-temp_min);
+	if (pct < 0.0) {
+		pct = 0.0;
+	} else if (pct > 1.0) {
+		pct = 1.0;
+	}
+	for (int i = 0; i < cnt; i++) {
+		int speed = fans[i].min + (fans[i].max - fans[i].min)*pct;
+		fseek(fans[i].speed_f, 0, SEEK_SET);
+		fprintf(fans[i].speed_f, "%d", speed);
+		fprintf(stderr, "FAN %d: %d RPM ", i+1, speed);
+	}
+}
 
 int count_fans() {
 	DIR *dir = opendir("/sys/devices/platform/applesmc.768/");
@@ -33,6 +178,7 @@ int main(int argc, char **argv) {
 
 	pid = fork();
 	if (pid < 0) {
+		flog("Error getting pid\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -41,121 +187,40 @@ int main(int argc, char **argv) {
 	}
 
 	umask(0);
-	FILE *log_f = fopen("/var/log/fans.log", "w");
-	time_t time_start;
-	char time_buf[26];
-	struct tm *tm_info;
-	time(&time_start);
-	tm_info = localtime(&time_start);
-	strftime(time_buf, 26, "%Y-%m-%d %H:%M:%S", tm_info);
-	fprintf(log_f, "fansd - launched at %s\n", time_buf);
 
 	sid = setsid();
 	if (sid < 0) {
-		fprintf(log_f, "bad sid - exiting\n");
-		fclose(log_f);
+		flog("Error getting sid\n");
 		exit(EXIT_FAILURE);
 	}
 
 	if (chdir("/") < 0) {
-		fprintf(log_f, "error changing to / - exiting\n");
-		fclose(log_f);
+		flog("Error changing to root dir\n");
 		exit(EXIT_FAILURE);
 	}
 
 	close(STDIN_FILENO);
 	close(STDOUT_FILENO);
-	close(STDERR_FILENO);
 
-	FILE *conf_f = fopen("/etc/fans/fans.conf", "r");
+	freopen("/var/log/fans.log", "w", stderr);
+	flog("fansd\n");
+
 	double temp_max = MAX_TEMP;
 	double temp_min = MIN_TEMP;
-	if (conf_f) {
-		char temp[5];
-		fgets(temp, 5, conf_f);
-		temp_max = (double)atoi(temp);
-		fgets(temp, 5, conf_f);
-		temp_min = (double)atoi(temp);
-		fclose(conf_f);
-	} 
-	fprintf(log_f, "\nUsing max temp of %.1f and a min of %.1f\n", temp_max, temp_min);
+	fan_conf(&temp_min, &temp_max);
+	flog("Using max temp of %.1f and a min of %.1f\n", temp_max, temp_min);
 
-	int fans = count_fans();
-	FILE *ctl_f, *min_f, *max_f, **speed_f = malloc(fans*sizeof(*speed_f));
-	size_t ctl_len = strlen("/sys/devices/platform/applesmc.768/fanX_manual");
-	size_t speed_len = strlen("/sys/devices/platform/applesmc.768/fanX_output");
-	size_t min_len = strlen("/sys/devices/platform/applesmc.768/fanX_min");
-	int *min = malloc(sizeof(*min)*fans);
-       	int *max = malloc(sizeof(*max)*fans);
+	int fan_cnt = count_fans();
+	Fan *fans = fan_init(fan_cnt);
 
-	for (int i = 0; i < fans; i++) {
-		char *ctl_fname = malloc(ctl_len+1);
-		sprintf(ctl_fname, "/sys/devices/platform/applesmc.768/fan%d_manual", i+1);
-		ctl_f = fopen(ctl_fname, "w");
-		fputc('1', ctl_f);
-		free(ctl_fname);
-		fclose(ctl_f);
-
-		char *speed_fname = malloc(speed_len+1);
-		sprintf(speed_fname, "/sys/devices/platform/applesmc.768/fan%d_output", i+1);
-		speed_f[i] = fopen(speed_fname, "a");
-		free(speed_fname);
-
-
-		char *min_fname = malloc(min_len+1);
-		sprintf(min_fname, "/sys/devices/platform/applesmc.768/fan%d_min", i+1);
-		min_f = fopen(min_fname, "r");
-		free(min_fname);
-		char min_s[20];
-		fgets(min_s, 19, min_f);
-		min[i] = atoi(min_s);
-		fclose(min_f);
-
-
-		char *max_fname = malloc(min_len+1);
-		sprintf(max_fname, "/sys/devices/platform/applesmc.768/fan%d_max", i+1);
-		max_f = fopen(max_fname, "r");
-		free(max_fname);
-		char max_s[20];
-		fgets(max_s, 19, max_f);
-		max[i] = atoi(max_s);
-		fclose(max_f);
-
-		fprintf(log_f, "Fan %d configuration\n============\nMin RPM: %d Max RPM: %d\n\n", i+1, min[i], max[i]);
-	}
-	
-	char temp_s[20];
-	double temp;
 	while (1) {
-		FILE *temp_f = fopen("/sys/devices/platform/applesmc.768/temp7_input", "r");
-		fgets(temp_s, 19, temp_f);
-		temp = atoi(temp_s)*(9.0/5.0)/1000.0 + 32.0;
-		double pct = ((double)temp-temp_min)/(temp_max-temp_min);
-		if (pct < 0.0) {
-			pct = 0.0;
-		} else if (pct > 1.0) {
-			pct = 1.0;
-		}
-		fprintf(log_f, "TEMP: %.2f ", temp);
-		for (int i = 0; i < fans; i++) {
-			int speed = min[i] + (max[i] - min[i])*pct;
-			fseek(speed_f[i], 0, SEEK_SET);
-			fprintf(speed_f[i], "%d", speed);
-			fprintf(log_f, "FAN %d: %d RPM ", i+1, speed);
-		}
-		fprintf(log_f, "\n");
-		fclose(temp_f);
-		fflush(log_f);
+		double temp = proc_temp();	
+		flog("TEMP: %.2f ", temp);
+		fan_adjust(fans, fan_cnt, temp, temp_min, temp_max);
 		sleep(5);
 	}
 
-	for (int i = 0; i < fans; i++) {
-		fclose(speed_f[i]);
-	}
-
-	fclose(log_f);
-	free(speed_f);
-	free(min);
-	free(max);
+	fclose(stderr);
+	fan_close(fans, fan_cnt);
 	return EXIT_SUCCESS;
 }

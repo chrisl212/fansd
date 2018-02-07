@@ -8,9 +8,25 @@
 #include <syslog.h>
 #include <string.h>
 #include <time.h>
+#include <dirent.h>
 
 #define MAX_TEMP 110.0
 #define MIN_TEMP 85.0
+
+int count_fans() {
+	DIR *dir = opendir("/sys/devices/platform/applesmc.768/");
+	struct dirent *entry = NULL;
+	int fans = 0;
+
+	while ((entry = readdir(dir))) {
+		if (entry->d_name[0] == 'f') {
+			fans++;
+		}
+	}
+
+	closedir(dir);
+	return fans/7;
+}
 
 int main(int argc, char **argv) {
 	pid_t pid, sid;
@@ -26,7 +42,13 @@ int main(int argc, char **argv) {
 
 	umask(0);
 	FILE *log_f = fopen("/var/log/fans.log", "w");
-	fprintf(log_f, "fansd - launched\n");
+	time_t time_start;
+	char time_buf[26];
+	struct tm *tm_info;
+	time(&time_start);
+	tm_info = localtime(&time_start);
+	strftime(time_buf, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+	fprintf(log_f, "fansd - launched at %s\n", time_buf);
 
 	sid = setsid();
 	if (sid < 0) {
@@ -45,13 +67,28 @@ int main(int argc, char **argv) {
 	close(STDOUT_FILENO);
 	close(STDERR_FILENO);
 
-	FILE *ctl_f, *speed_f[3], *min_f, *max_f;
+	FILE *conf_f = fopen("/etc/fans/fans.conf", "r");
+	double temp_max = MAX_TEMP;
+	double temp_min = MIN_TEMP;
+	if (conf_f) {
+		char temp[5];
+		fgets(temp, 5, conf_f);
+		temp_max = (double)atoi(temp);
+		fgets(temp, 5, conf_f);
+		temp_min = (double)atoi(temp);
+		fclose(conf_f);
+	} 
+	fprintf(log_f, "\nUsing max temp of %.1f and a min of %.1f\n", temp_max, temp_min);
+
+	int fans = count_fans();
+	FILE *ctl_f, *min_f, *max_f, **speed_f = malloc(fans*sizeof(*speed_f));
 	size_t ctl_len = strlen("/sys/devices/platform/applesmc.768/fanX_manual");
 	size_t speed_len = strlen("/sys/devices/platform/applesmc.768/fanX_output");
 	size_t min_len = strlen("/sys/devices/platform/applesmc.768/fanX_min");
-	int min[3], max[3];
+	int *min = malloc(sizeof(*min)*fans);
+       	int *max = malloc(sizeof(*max)*fans);
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < fans; i++) {
 		char *ctl_fname = malloc(ctl_len+1);
 		sprintf(ctl_fname, "/sys/devices/platform/applesmc.768/fan%d_manual", i+1);
 		ctl_f = fopen(ctl_fname, "w");
@@ -93,14 +130,14 @@ int main(int argc, char **argv) {
 		FILE *temp_f = fopen("/sys/devices/platform/applesmc.768/temp7_input", "r");
 		fgets(temp_s, 19, temp_f);
 		temp = atoi(temp_s)*(9.0/5.0)/1000.0 + 32.0;
-		double pct = ((double)temp-MIN_TEMP)/(MAX_TEMP-MIN_TEMP);
+		double pct = ((double)temp-temp_min)/(temp_max-temp_min);
 		if (pct < 0.0) {
 			pct = 0.0;
 		} else if (pct > 1.0) {
 			pct = 1.0;
 		}
 		fprintf(log_f, "TEMP: %.2f ", temp);
-		for (int i = 0; i < 3; i++) {
+		for (int i = 0; i < fans; i++) {
 			int speed = min[i] + (max[i] - min[i])*pct;
 			fseek(speed_f[i], 0, SEEK_SET);
 			fprintf(speed_f[i], "%d", speed);
@@ -112,9 +149,13 @@ int main(int argc, char **argv) {
 		sleep(5);
 	}
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < fans; i++) {
 		fclose(speed_f[i]);
 	}
+
 	fclose(log_f);
+	free(speed_f);
+	free(min);
+	free(max);
 	return EXIT_SUCCESS;
 }

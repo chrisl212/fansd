@@ -13,6 +13,8 @@
 
 #define MAX_TEMP 110.0
 #define MIN_TEMP 85.0
+#define VMAJ 0
+#define VMIN 1
 
 typedef struct _Fan {
 	int rpm, num, min, max;
@@ -29,7 +31,7 @@ void flog(char *fmt, ...) {
 	tm_info = localtime(&timer);
 	strftime(buf, 26, "%Y-%m-%d %H:%M:%S", tm_info);
 
-	fprintf(stderr, "\n[%s] - ", buf);
+	fprintf(stderr, "[%s] - ", buf);
 
 	va_start(lst, fmt);
 	vfprintf(stderr, fmt, lst);
@@ -40,6 +42,9 @@ void flog(char *fmt, ...) {
 double proc_temp() {
 	char temp_s[10];
 	FILE *temp_f = fopen("/sys/devices/platform/applesmc.768/temp7_input", "r");
+	if (!temp_f) {
+		return -1.0;
+	}
 	fgets(temp_s, 10, temp_f);
 	fclose(temp_f);
 
@@ -119,25 +124,35 @@ Fan *fan_init(int fans) {
 	for (int i = 0; i < fans; i++) {
 		fan_a[i].num = i+1;
 		if (fan_manual(i+1, 1)) {
-			flog("Error setting manual fan control for fan %d\n", i+1);
+			flog("ERROR: could not set manual fan control for fan %d\n", i+1);
+			free(fan_a);
+			return NULL;
 		}
 
 		char *speed_fname = malloc(len+1);
 		sprintf(speed_fname, "/sys/devices/platform/applesmc.768/fan%d_output", i+1);
 		fan_a[i].speed_f = fopen(speed_fname, "a");
+		if (!fan_a[i].speed_f) {
+			flog("ERROR: could not open output for fan %d\n", i+1);
+			free(fan_a);
+			return NULL;
+		}
 		free(speed_fname);
 
 		if (fan_minmax(i+1, &(fan_a[i].min), &(fan_a[i].max))) { 
-			flog("Error fetching min and max RPM for fan %d\n", i+1);
+			flog("ERROR: error fetching min and max RPM for fan %d\n", i+1);
+			free(fan_a);
+			return NULL;
 		}
 
-		flog("Fan %d configuration\n============\nMin RPM: %d Max RPM: %d\n", i+1, fan_a[i].min, fan_a[i].max);
+		flog("Fan %d configuration\n\t\t\t============\n\t\t\tMin RPM: %d Max RPM: %d\n", i+1, fan_a[i].min, fan_a[i].max);
 	}
 	return fan_a;
 }
 
 void fan_close(Fan *fans, int cnt) {
 	for (int i = 0; i < cnt; i++) {
+		fan_manual(i+1, 0);
 		fclose(fans[i].speed_f);
 	}
 	free(fans);
@@ -160,6 +175,9 @@ void fan_adjust(Fan *fans, int cnt, double temp, double temp_min, double temp_ma
 
 int count_fans() {
 	DIR *dir = opendir("/sys/devices/platform/applesmc.768/");
+	if (!dir) {
+		return -1;
+	}
 	struct dirent *entry = NULL;
 	int fans = 0;
 
@@ -203,7 +221,7 @@ int main(int argc, char **argv) {
 	close(STDOUT_FILENO);
 
 	freopen("/var/log/fans.log", "w", stderr);
-	flog("fansd\n");
+	flog("fansd v%d.%d\n", VMAJ, VMIN);
 
 	double temp_max = MAX_TEMP;
 	double temp_min = MIN_TEMP;
@@ -211,10 +229,23 @@ int main(int argc, char **argv) {
 	flog("Using max temp of %.1f and a min of %.1f\n", temp_max, temp_min);
 
 	int fan_cnt = count_fans();
+	if (fan_cnt == -1) {
+		flog("ERROR: could not count fans\n");
+		exit(EXIT_FAILURE);
+	}
 	Fan *fans = fan_init(fan_cnt);
+	if (!fans) {
+		flog("ERROR: could not initialize fans\n");
+		exit(EXIT_FAILURE);
+	}
 
 	while (1) {
-		double temp = proc_temp();	
+		double temp = proc_temp();
+		if (temp < 0.0) {
+			flog("ERROR: could not read temperature\n");
+			exit(EXIT_FAILURE);
+		}
+		fprintf(stderr, "\r");
 		flog("TEMP: %.2f ", temp);
 		fan_adjust(fans, fan_cnt, temp, temp_min, temp_max);
 		sleep(5);
@@ -222,5 +253,5 @@ int main(int argc, char **argv) {
 
 	fclose(stderr);
 	fan_close(fans, fan_cnt);
-	return EXIT_SUCCESS;
+	exit(EXIT_SUCCESS);
 }

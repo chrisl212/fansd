@@ -68,13 +68,13 @@ void fan_conf(double *min, double *max) {
 int fan_manual(int fan, int opt) {
 	size_t len = strlen("/sys/devices/platform/applesmc.768/fanX_manual");
 	char *fname = malloc(len+1);
-
+	char opt_c = '0' + opt;
 	sprintf(fname, "/sys/devices/platform/applesmc.768/fan%d_manual", fan);
 	FILE *ctl_f = fopen(fname, "w");
 	if (!ctl_f) {
 		return EXIT_FAILURE;
 	}
-	if (fwrite(&opt, sizeof(opt), 1, ctl_f) != 1) {
+	if (fwrite(&opt_c, 1, 1, ctl_f) != 1) {
 		fclose(ctl_f);
 		free(fname);
 		return EXIT_FAILURE;	
